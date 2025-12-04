@@ -8,6 +8,7 @@ from pydantic import BaseModel
 import os
 import google.generativeai as genai
 from google.generativeai.types import FunctionDeclaration, Tool
+# Removed 'Part' from imports because it causes an error in your version
 from dotenv import load_dotenv
 from functools import partial
 
@@ -40,35 +41,42 @@ class UserQuery(BaseModel):
     user_id: str
     voice_transcript: str
 
+# --- Tool Execution Map ---
+# This links the "simple" names Gemini sees to the "real" functions in tools.py
+GEMINI_TOOL_MAP = {
+    "my_recent_activities": get_recent_activities_summary,
+    "analyze_ride": analyze_specific_ride_depth,
+    "my_progression": check_progression,
+    "update_stats": update_user_physical_stats
+}
+
 # --- Agent/Tool Setup ---
 
 def create_gemini_chat(user_id: str, history: list):
     """
     Creates a Gemini ChatSession with tools bound to the specific user_id.
     """
-    # Create partial functions that already have user_id filled in.
-    # The LLM sees a function signature without user_id.
     
+    # 1. Define the tools with docstrings (Gemini reads these to know what to do)
     def my_recent_activities():
         """Get a summary of my activities from the last 14 days, including ID, distance, and intensity."""
-        return get_recent_activities_summary(user_id)
+        pass 
 
     def analyze_ride(activity_id: int):
         """Analyze a specific ride in detail (using streams like HR, cadence) given its ID."""
-        return analyze_specific_ride_depth(user_id, activity_id)
+        pass
 
     def my_progression():
         """Check if my training volume/intensity is increasing or decreasing compared to last month."""
-        return check_progression(user_id)
+        pass
     
     def update_stats(weight_kg: float = None, ftp: int = None):
         """Update my physical stats (weight in kg, FTP in watts)."""
-        return update_user_physical_stats(user_id, weight_kg, ftp)
+        pass
 
-    # Define the toolset
+    # 2. Bundle them up
     tools = [my_recent_activities, analyze_ride, my_progression, update_stats]
     
-    # System Instruction
     system_instruction = """
     You are Crank'd, an expert AI cycling coach. 
     Your goal is to help the user improve their fitness using their Strava data.
@@ -83,14 +91,12 @@ def create_gemini_chat(user_id: str, history: list):
     """
 
     model = genai.GenerativeModel(
-        model_name='gemini-1.5-flash',
+        model_name='gemini-2.5-flash', # Or 'gemini-2.0-flash-exp' if available
         tools=tools,
         system_instruction=system_instruction
     )
     
     # Convert history format (OpenAI -> Gemini)
-    # OpenAI: {'role': 'user', 'content': '...'}
-    # Gemini: {'role': 'user', 'parts': ['...']}
     gemini_history = []
     for turn in history:
         role = "user" if turn["role"] == "user" else "model"
@@ -104,32 +110,76 @@ def create_gemini_chat(user_id: str, history: list):
 @app.post("/coach")
 async def coach_session(query: UserQuery):
     try:
-        # 1. Retrieve Memory
+        # 1. Init Chat
         conversation_history = get_conversation_history(query.user_id)
-        
-        # 2. Initialize Agent with Tools
         chat = create_gemini_chat(query.user_id, conversation_history)
         
-        # 3. Send Message (Handles tool calling loop automatically)
-        response = chat.send_message(query.voice_transcript)
+        current_content = query.voice_transcript
+        ai_text = "I'm sorry, I couldn't process your request."
+
+        # 2. Manual Tool Calling Loop (ReAct Pattern)
+        for _ in range(10): # Max 10 turns to prevent infinite loops
+            
+            # Send message to model
+            response = chat.send_message(current_content)
+            
+            # Check if model wants to call a function
+            # In the Python SDK, function_call is inside parts[0]
+            if response.parts[0].function_call:
+                
+                # Get call details
+                fc = response.parts[0].function_call
+                tool_name = fc.name
+                tool_args = dict(fc.args)
+                
+                print(f"🤖 Agent requesting tool: {tool_name} with args: {tool_args}")
+                
+                # Find actual function
+                func_to_run = GEMINI_TOOL_MAP.get(tool_name)
+                
+                if func_to_run:
+                    try:
+                        # Inject user_id since our backend functions need it
+                        result = func_to_run(user_id=query.user_id, **tool_args)
+                    except Exception as e:
+                        result = f"Error executing {tool_name}: {str(e)}"
+                else:
+                    result = f"Error: Tool {tool_name} not found."
+
+                # Send result back to model
+                # FIX: Using dictionary format compatible with your installed SDK
+                current_content = {
+                    "role": "function",
+                    "parts": [
+                        {
+                            "function_response": {
+                                "name": tool_name,
+                                "response": {"result": result}
+                            }
+                        }
+                    ]
+                }
+                # The loop continues; we send this content back to chat.send_message
+                
+            else:
+                # No function call -> Final text response
+                ai_text = response.text
+                break
         
-        # 4. Extract Text Response
-        ai_text = response.text
-        
-        # 5. Update Memory
+        # 3. Save & Return
         update_conversation_history(query.user_id, query.voice_transcript, ai_text)
-        
         return {"advice": ai_text}
         
     except Exception as e:
         print(f"Error in coach_session: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Return error as normal text so the client doesn't crash
+        return {"advice": f"I encountered an error: {str(e)}"}
 
 @app.get("/health")
 async def health_check():
-    return {"status": "Running", "model": "gemini-1.5-flash"}
+    return {"status": "Running"}
 
-# --- Strava Auth (Legacy/Callback) ---
+# --- Strava Auth ---
 @app.get("/strava/callback")
 async def strava_callback(request: Request):
     code = request.query_params.get("code")
@@ -149,8 +199,6 @@ async def strava_callback(request: Request):
         response.raise_for_status()
         tokens = response.json()
         
-        # Update our in-memory store (via reference in strava_client if we imported it, 
-        # or just modify the dict since we imported it from there)
         user_tokens[user_id] = {
             "access_token": tokens["access_token"],
             "refresh_token": tokens["refresh_token"],
