@@ -1,0 +1,5 @@
+curl -X POST https://www.strava.com/oauth/token \
+    -d client_id="179941" \
+    -d client_secret="b12ba6182da8fa9c2def2fe1dcb0acda879deaed" \
+    -d code="6c0aba407f56c4a189647f0fa3cbdc59965e06de" \
+    -d grant_type=authorization_code
